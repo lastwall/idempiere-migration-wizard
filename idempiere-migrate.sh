@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # ==========================================
-# iDempiere Migration Wizard (pull-from-old)
+# iDempiere Migration Wizard (pull-from-old) + Hostname update
 # ==========================================
+# Adds automated hostname/FQDN update and /etc/hosts edit.
 # What it does (on NEW server):
+#  0) Prompts for desired hostname/FQDN and updates system hostname + /etc/hosts
 #  1) Prompts for old server IP/user/(optional) password
 #  2) Verifies DB export file exists on old server
 #  3) Stops local iDempiere
@@ -18,17 +20,15 @@ set -euo pipefail
 #  - sshpass (only if you use password auth)
 #  - run as root (or with full sudo)
 #
-# NOTE:
+# NOTES:
 #  - The export should have been run on the OLD server:
 #       cd /opt/idempiere-server/utils
 #       ./RUN_DBExport.sh
-#  - This script *verifies* there is an ExpDat.dmp on the old server
-#    under /syvasoft/idempiere-server/data (per your paths).
+#  - This script verifies existence of ExpDat.dmp under /syvasoft/idempiere-server/data
 # ==========================================
 
 ### Configurable defaults (change if your layout differs)
 IDEMPIERE_SERVICE="idempiere"
-# Folder set to sync from OLD -> NEW (exactly as requested)
 SYNC_PATHS=(
   "/syvasoft/archive"
   "/syvasoft/attachments"
@@ -37,7 +37,6 @@ SYNC_PATHS=(
   "/syvasoft/store"
   "/syvasoft/idempiere-server/data"
 )
-# Where we expect the export file on the OLD server (verify step)
 EXPORT_FILE_CHECK="/syvasoft/idempiere-server/data/ExpDat.dmp"
 UTILS_DIR="/syvasoft/idempiere-server/utils" # on NEW server
 
@@ -63,10 +62,62 @@ die() { echo "ERROR: $*" | tee -a "$LOGFILE"; exit 1; }
 exec > >(tee -a "$LOGFILE") 2>&1
 
 hr
-echo "iDempiere Migration Wizard (pull from OLD -> NEW)"
+echo "iDempiere Migration Wizard (pull from OLD -> NEW) + Hostname update"
 echo "Log: $LOGFILE"
 hr
 
+### Hostname update (NEW server)
+read -rp "Enter short hostname (e.g. 'zion'): " SHORT_HOST
+read -rp "Enter domain (default: syvasoft.in). Leave empty for none: " DOMAIN
+DOMAIN=${DOMAIN:-syvasoft.in}
+if [[ -z "$DOMAIN" ]]; then
+  FQDN="$SHORT_HOST"
+else
+  FQDN="$SHORT_HOST.$DOMAIN"
+fi
+OLD_HOSTNAME="$(hostname)"
+
+say "Updating hostname to: $FQDN (short: $SHORT_HOST)"
+
+# Backup /etc/hosts
+HOSTS_BAK="/etc/hosts.bak.$TIMESTAMP"
+cp /etc/hosts "$HOSTS_BAK"
+chmod 0644 "$HOSTS_BAK"
+
+# Try to detect primary IPv4 address
+PRIMARY_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
+if [[ -z "$PRIMARY_IP" ]]; then
+  PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+
+# Build new hosts file: keep lines that do not contain old hostname or new FQDN
+awk -v old="$OLD_HOSTNAME" -v newfqdn="$FQDN" '($0 !~ old) && ($0 !~ newfqdn) {print}' /etc/hosts > /tmp/hosts.new
+
+# Add mapping. Prefer primary IP if available, fallback to 127.0.1.1
+if [[ -n "$PRIMARY_IP" && "$PRIMARY_IP" != "" && "$PRIMARY_IP" != "127.0.0.1" ]]; then
+  echo "$PRIMARY_IP $FQDN $SHORT_HOST" >> /tmp/hosts.new
+else
+  echo "127.0.1.1 $FQDN $SHORT_HOST" >> /tmp/hosts.new
+fi
+
+# Ensure localhost line exists (do not duplicate)
+if ! grep -q "127.0.0.1[[:space:]].*localhost" /tmp/hosts.new; then
+  echo "127.0.0.1 localhost" >> /tmp/hosts.new
+fi
+
+# Install the new hosts file
+mv /tmp/hosts.new /etc/hosts
+chmod 0644 /etc/hosts
+
+# Set system hostname
+hostnamectl set-hostname "$FQDN"
+
+say "Hostname changed from '$OLD_HOSTNAME' to '$FQDN'. Backup of previous /etc/hosts saved to $HOSTS_BAK"
+
+say "New /etc/hosts contents:"
+cat /etc/hosts | sed -n '1,200p'
+
+# Continue with migration prompts
 read -rp "Old server IP or hostname: " OLD_HOST
 read -rp "Old server SSH username: " OLD_USER
 
@@ -98,7 +149,7 @@ say "Verifying DB export on OLD server: $EXPORT_FILE_CHECK"
 if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'test -f \"$EXPORT_FILE_CHECK\"'"; then
   echo
   echo "It looks like $EXPORT_FILE_CHECK does not exist on the OLD server."
-  echo "You said you've already run the export:"
+  echo "You said you've already run the export:" 
   echo "  cd /opt/idempiere-server/utils && ./RUN_DBExport.sh"
   echo
   read -rp "Continue anyway? (y/N): " CONT
@@ -118,14 +169,13 @@ systemctl is-active --quiet "$IDEMPIERE_SERVICE" && die "Service still active; s
 for p in "${SYNC_PATHS[@]}"; do
   say "Syncing $p  (OLD -> NEW)"
   mkdir -p "$p"
-  # --info=progress2 prints a nice running progress meter
   rsync -ah --delete --info=progress2 -e "$RSYNC_SSH" "$OLD_USER@$OLD_HOST:$p/" "$p/"
 done
 
 # Ownership and permissions
 say "Fixing ownership and permissions under /syvasoft"
-chown -R idempiere:idempiere /syvasoft
-chmod 0755 /syvasoft
+chown -R idempiere:idempiere /syvasoft || true
+chmod 0755 /syvasoft || true
 
 # Restore DB + SyncDB
 if [[ ! -d "$UTILS_DIR" ]]; then
