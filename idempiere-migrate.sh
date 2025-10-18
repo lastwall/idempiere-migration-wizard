@@ -8,23 +8,22 @@ set -euo pipefail
 # What it does (on NEW server):
 #  0) Prompts for desired hostname/FQDN and updates system hostname + /etc/hosts
 #  1) Prompts for old server IP/user/(optional) password
-#  2) Verifies DB export file exists on old server
+#  2) Verifies DB export file exists on old server (default or custom path)
 #  3) Stops local iDempiere
 #  4) Rsyncs data folders from old -> new (with progress)
 #  5) Fixes ownership/permissions
-#  6) Restores DB + SyncDB
+#  6) Restores DB + SyncDB (runs tolerant to errors)
 #  7) Starts iDempiere
 #
 # Requirements on NEW server:
-#  - bash, rsync, ssh
-#  - sshpass (only if you use password auth)
+#  - bash, rsync, ssh, apt-get (if password auth and sshpass installation required)
+#  - sshpass will be installed automatically via apt if needed
 #  - run as root (or with full sudo)
 #
 # NOTES:
 #  - The export should have been run on the OLD server:
 #       cd /opt/idempiere-server/utils
 #       ./RUN_DBExport.sh
-#  - This script verifies existence of ExpDat.dmp under /syvasoft/idempiere-server/data
 # ==========================================
 
 ### Configurable defaults (change if your layout differs)
@@ -37,7 +36,8 @@ SYNC_PATHS=(
   "/syvasoft/store"
   "/syvasoft/idempiere-server/data"
 )
-EXPORT_FILE_CHECK="/syvasoft/idempiere-server/data/ExpDat.dmp"
+# default export path (can be changed by user prompt below)
+DEFAULT_EXPORT_FILE="/syvasoft/idempiere-server/data/ExpDat.dmp"
 UTILS_DIR="/syvasoft/idempiere-server/utils" # on NEW server
 
 ### Logging
@@ -115,11 +115,15 @@ hostnamectl set-hostname "$FQDN"
 say "Hostname changed from '$OLD_HOSTNAME' to '$FQDN'. Backup of previous /etc/hosts saved to $HOSTS_BAK"
 
 say "New /etc/hosts contents:"
-cat /etc/hosts | sed -n '1,200p'
+sed -n '1,200p' /etc/hosts
 
 # Continue with migration prompts
 read -rp "Old server IP or hostname: " OLD_HOST
 read -rp "Old server SSH username: " OLD_USER
+
+# ask for export path on old server (default provided)
+read -rp "Path to DB export on OLD server (default: $DEFAULT_EXPORT_FILE): " EXPORT_FILE_CHECK
+EXPORT_FILE_CHECK=${EXPORT_FILE_CHECK:-$DEFAULT_EXPORT_FILE}
 
 echo
 read -rp "Use SSH key auth? (Y/n): " USE_KEY
@@ -129,9 +133,21 @@ SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 RSYNC_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 if [[ "$USE_KEY" =~ ^[Nn]$ ]]; then
+  # If sshpass not found, try to install via apt-get automatically
   if ! command -v sshpass >/dev/null 2>&1; then
-    die "sshpass not found. Install it (e.g., apt install -y sshpass) or use SSH keys."
+    if command -v apt-get >/dev/null 2>&1; then
+      say "sshpass not found. Installing sshpass via apt-get (non-interactive)..."
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y sshpass
+      if ! command -v sshpass >/dev/null 2>&1; then
+        die "sshpass installation failed. Please install sshpass or use SSH key auth."
+      fi
+    else
+      die "sshpass not found and apt-get not available. Install sshpass or use SSH key auth."
+    fi
   fi
+
   read -rs -p "Old server SSH password: " OLD_PASS; echo
   SSH_CMD="sshpass -p '$OLD_PASS' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
   RSYNC_SSH="sshpass -p '$OLD_PASS' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
@@ -139,7 +155,7 @@ fi
 
 # Connectivity check
 say "Checking SSH connectivity to $OLD_USER@$OLD_HOST ..."
-if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'echo connected' >/dev/null"; then
+if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'echo connected' >/dev/null 2>&1"; then
   die "Cannot SSH to $OLD_USER@$OLD_HOST. Check IP/user/auth."
 fi
 echo "OK."
@@ -149,7 +165,7 @@ say "Verifying DB export on OLD server: $EXPORT_FILE_CHECK"
 if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'test -f \"$EXPORT_FILE_CHECK\"'"; then
   echo
   echo "It looks like $EXPORT_FILE_CHECK does not exist on the OLD server."
-  echo "You said you've already run the export:" 
+  echo "You said you've already run the export:"
   echo "  cd /opt/idempiere-server/utils && ./RUN_DBExport.sh"
   echo
   read -rp "Continue anyway? (y/N): " CONT
@@ -177,20 +193,43 @@ say "Fixing ownership and permissions under /syvasoft"
 chown -R idempiere:idempiere /syvasoft || true
 chmod 0755 /syvasoft || true
 
-# Restore DB + SyncDB
+# Restore DB + SyncDB (tolerant to errors — continue on failure)
 if [[ ! -d "$UTILS_DIR" ]]; then
   die "Utils directory not found: $UTILS_DIR"
 fi
 
-say "Running RUN_DBRestore.sh (this may take a while)"
-( cd "$UTILS_DIR" && ./RUN_DBRestore.sh )
+say "Running RUN_DBRestore.sh (this may take a while). Output will be logged and errors will not stop the wizard."
+# Run and capture output, but do not exit on non-zero
+(
+  set +e
+  cd "$UTILS_DIR"
+  ./RUN_DBRestore.sh 2>&1 | tee -a "$LOGFILE"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    say "Warning: RUN_DBRestore.sh exited with code $rc — continuing (check logs)."
+  else
+    say "RUN_DBRestore.sh finished successfully."
+  fi
+  set -e
+)
 
-say "Running RUN_SyncDB.sh"
-( cd "$UTILS_DIR" && ./RUN_SyncDB.sh )
+say "Running RUN_SyncDB.sh (this may show errors but we will continue)."
+(
+  set +e
+  cd "$UTILS_DIR"
+  ./RUN_SyncDB.sh 2>&1 | tee -a "$LOGFILE"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    say "Warning: RUN_SyncDB.sh exited with code $rc — continuing (these errors often are non-fatal)."
+  else
+    say "RUN_SyncDB.sh finished successfully."
+  fi
+  set -e
+)
 
 # Start service
 say "Starting service: $IDEMPIERE_SERVICE"
-systemctl start "$IDEMPIERE_SERVICE"
+systemctl start "$IDEMPIERE_SERVICE" || true
 
 # Final status
 sleep 2
@@ -198,8 +237,8 @@ if systemctl is-active --quiet "$IDEMPIERE_SERVICE"; then
   say "✅ Migration complete. $IDEMPIERE_SERVICE is active."
 else
   say "⚠️ Service not active. Showing last journal lines:"
-  journalctl -u "$IDEMPIERE_SERVICE" -n 200 --no-pager
-  die "Service failed to start. See logs above and $LOGFILE"
+  journalctl -u "$IDEMPIERE_SERVICE" -n 200 --no-pager | tee -a "$LOGFILE"
+  say "Please inspect $LOGFILE and journal output above; continuing to finish."
 fi
 
 say "Done. Full log saved to: $LOGFILE"
