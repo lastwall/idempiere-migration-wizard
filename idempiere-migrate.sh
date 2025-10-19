@@ -24,10 +24,14 @@ set -euo pipefail
 #  - The export should have been run on the OLD server:
 #       cd /opt/idempiere-server/utils
 #       ./RUN_DBExport.sh
+# - Checks remote paths before rsync
+# - If remote path missing: ask for alternative path or skip
+# - Runs rsync tolerant to failures and logs everything
 # ==========================================
 
 ### Configurable defaults (change if your layout differs)
 IDEMPIERE_SERVICE="idempiere"
+# Default local target paths to mirror from OLD server (you can skip or provide alternate remote)
 SYNC_PATHS=(
   "/syvasoft/archive"
   "/syvasoft/attachments"
@@ -36,7 +40,7 @@ SYNC_PATHS=(
   "/syvasoft/store"
   "/syvasoft/idempiere-server/data"
 )
-# default export path (can be changed by user prompt below)
+# default export file path on OLD server (can change at prompt)
 DEFAULT_EXPORT_FILE="/syvasoft/idempiere-server/data/ExpDat.dmp"
 UTILS_DIR="/syvasoft/idempiere-server/utils" # on NEW server
 
@@ -53,7 +57,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-### Pretty helpers
+### Helpers
 hr() { printf '%*s\n' "${COLUMNS:-80}" '' | tr ' ' '='; }
 say() { echo -e "\n==> $*"; echo -e "\n==> $*" >>"$LOGFILE"; }
 die() { echo "ERROR: $*" | tee -a "$LOGFILE"; exit 1; }
@@ -66,7 +70,7 @@ echo "iDempiere Migration Wizard (pull from OLD -> NEW) + Hostname update"
 echo "Log: $LOGFILE"
 hr
 
-### Hostname update (NEW server)
+##### HOSTNAME SECTION #####
 read -rp "Enter short hostname (e.g. 'zion'): " SHORT_HOST
 read -rp "Enter domain (default: syvasoft.in). Leave empty for none: " DOMAIN
 DOMAIN=${DOMAIN:-syvasoft.in}
@@ -84,7 +88,7 @@ HOSTS_BAK="/etc/hosts.bak.$TIMESTAMP"
 cp /etc/hosts "$HOSTS_BAK"
 chmod 0644 "$HOSTS_BAK"
 
-# Try to detect primary IPv4 address
+# Detect primary IPv4 address
 PRIMARY_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
 if [[ -z "$PRIMARY_IP" ]]; then
   PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -105,19 +109,15 @@ if ! grep -q "127.0.0.1[[:space:]].*localhost" /tmp/hosts.new; then
   echo "127.0.0.1 localhost" >> /tmp/hosts.new
 fi
 
-# Install the new hosts file
 mv /tmp/hosts.new /etc/hosts
 chmod 0644 /etc/hosts
-
-# Set system hostname
 hostnamectl set-hostname "$FQDN"
 
 say "Hostname changed from '$OLD_HOSTNAME' to '$FQDN'. Backup of previous /etc/hosts saved to $HOSTS_BAK"
-
 say "New /etc/hosts contents:"
 sed -n '1,200p' /etc/hosts
 
-# Continue with migration prompts
+##### CONNECTION + PATHS #####
 read -rp "Old server IP or hostname: " OLD_HOST
 read -rp "Old server SSH username: " OLD_USER
 
@@ -129,11 +129,12 @@ echo
 read -rp "Use SSH key auth? (Y/n): " USE_KEY
 USE_KEY=${USE_KEY:-Y}
 
-SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-RSYNC_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+# Build SSH command (we will use eval to expand properly)
+SSH_CMD_BASE="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+RSYNC_RSH_BASE="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 if [[ "$USE_KEY" =~ ^[Nn]$ ]]; then
-  # If sshpass not found, try to install via apt-get automatically
+  # ensure sshpass
   if ! command -v sshpass >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
       say "sshpass not found. Installing sshpass via apt-get (non-interactive)..."
@@ -149,20 +150,29 @@ if [[ "$USE_KEY" =~ ^[Nn]$ ]]; then
   fi
 
   read -rs -p "Old server SSH password: " OLD_PASS; echo
-  SSH_CMD="sshpass -p '$OLD_PASS' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-  RSYNC_SSH="sshpass -p '$OLD_PASS' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  # Use single-quoted password wrapper inside sshpass by escaping single quotes properly
+  # We'll create quoted version safe for eval usage
+  # If password contains single quotes it will be handled by ANSI-C quoting fallback
+  ESC_OLD_PASS="${OLD_PASS//\'/\'\"\'\"\'}"  # escape single quotes
+  SSH_CMD="$SSH_CMD_BASE"
+  RSYNC_RSH="sshpass -p '$ESC_OLD_PASS' $RSYNC_RSH_BASE"
+  SSH_CMD_EVAL="sshpass -p '$ESC_OLD_PASS' $SSH_CMD_BASE"
+else
+  SSH_CMD="$SSH_CMD_BASE"
+  RSYNC_RSH="$RSYNC_RSH_BASE"
+  SSH_CMD_EVAL="$SSH_CMD"
 fi
 
-# Connectivity check
+# Simple connectivity test
 say "Checking SSH connectivity to $OLD_USER@$OLD_HOST ..."
-if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'echo connected' >/dev/null 2>&1"; then
+if ! eval "$SSH_CMD_EVAL $OLD_USER@$OLD_HOST 'echo connected' >/dev/null 2>&1"; then
   die "Cannot SSH to $OLD_USER@$OLD_HOST. Check IP/user/auth."
 fi
 echo "OK."
 
 # Verify export exists and show its size/date
 say "Verifying DB export on OLD server: $EXPORT_FILE_CHECK"
-if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'test -f \"$EXPORT_FILE_CHECK\"'"; then
+if ! eval "$SSH_CMD_EVAL $OLD_USER@$OLD_HOST 'test -f \"$EXPORT_FILE_CHECK\"'"; then
   echo
   echo "It looks like $EXPORT_FILE_CHECK does not exist on the OLD server."
   echo "You said you've already run the export:"
@@ -173,7 +183,7 @@ if ! eval "$SSH_CMD $OLD_USER@$OLD_HOST 'test -f \"$EXPORT_FILE_CHECK\"'"; then
     die "Please run the export on old server and re-run this wizard."
   fi
 else
-  eval "$SSH_CMD $OLD_USER@$OLD_HOST 'ls -lh --time-style=long-iso \"$EXPORT_FILE_CHECK\" || stat \"$EXPORT_FILE_CHECK\"'"
+  eval "$SSH_CMD_EVAL $OLD_USER@$OLD_HOST 'ls -lh --time-style=long-iso \"$EXPORT_FILE_CHECK\" || stat \"$EXPORT_FILE_CHECK\"'"
 fi
 
 # Stop local idempiere
@@ -181,11 +191,45 @@ say "Stopping local service: $IDEMPIERE_SERVICE"
 systemctl stop "$IDEMPIERE_SERVICE" || true
 systemctl is-active --quiet "$IDEMPIERE_SERVICE" && die "Service still active; stop it and retry." || echo "Stopped."
 
-# Rsync each path
-for p in "${SYNC_PATHS[@]}"; do
-  say "Syncing $p  (OLD -> NEW)"
-  mkdir -p "$p"
-  rsync -ah --delete --info=progress2 -e "$RSYNC_SSH" "$OLD_USER@$OLD_HOST:$p/" "$p/"
+##### SYNC LOOP with remote checks #####
+say "Beginning sync of configured paths. For any missing remote path you'll be prompted to provide an alternate or skip."
+
+for local_p in "${SYNC_PATHS[@]}"; do
+  # default remote path is same as local path
+  remote_p="$local_p"
+
+  # Check remote path existence
+  if ! eval "$SSH_CMD_EVAL $OLD_USER@$OLD_HOST 'test -d \"$remote_p\"' >/dev/null 2>&1; then
+    say "Remote path does not exist: $remote_p"
+    read -rp "Enter alternative remote path to sync to local '$local_p' (leave empty to skip this item): " alt_remote
+    if [[ -z "$alt_remote" ]]; then
+      say "Skipping sync for $local_p (no remote provided)."
+      continue
+    fi
+    remote_p="$alt_remote"
+    # Verify provided alternative exists; if not, prompt again or skip
+    if ! eval "$SSH_CMD_EVAL $OLD_USER@$OLD_HOST 'test -d \"$remote_p\"' >/dev/null 2>&1; then
+      say "Provided alternative remote path '$remote_p' does not exist on old server. Skipping."
+      continue
+    fi
+  fi
+
+  say "Syncing remote:$remote_p  -->  local:$local_p"
+  mkdir -p "$local_p"
+  # Run rsync tolerant to failures (do not exit the whole script)
+  (
+    set +e
+    RSYNC_CMD="rsync -ah --delete --info=progress2 -e \"$RSYNC_RSH\" \"$OLD_USER@$OLD_HOST:$remote_p/\" \"$local_p/\""
+    say "Running: $RSYNC_CMD"
+    eval "$RSYNC_CMD" 2>&1 | tee -a "$LOGFILE"
+    rc=${PIPESTATUS[0]:-0}
+    if [[ $rc -ne 0 ]]; then
+      say "Warning: rsync for $remote_p exited with code $rc. Check $LOGFILE for details. Continuing."
+    else
+      say "rsync for $remote_p finished successfully."
+    fi
+    set -e
+  )
 done
 
 # Ownership and permissions
@@ -193,13 +237,12 @@ say "Fixing ownership and permissions under /syvasoft"
 chown -R idempiere:idempiere /syvasoft || true
 chmod 0755 /syvasoft || true
 
-# Restore DB + SyncDB (tolerant to errors — continue on failure)
+# Restore DB + SyncDB (tolerant to errors)
 if [[ ! -d "$UTILS_DIR" ]]; then
   die "Utils directory not found: $UTILS_DIR"
 fi
 
-say "Running RUN_DBRestore.sh (this may take a while). Output will be logged and errors will not stop the wizard."
-# Run and capture output, but do not exit on non-zero
+say "Running RUN_DBRestore.sh (this may take a while). Output will be logged; errors will not stop the wizard."
 (
   set +e
   cd "$UTILS_DIR"
@@ -236,9 +279,9 @@ sleep 2
 if systemctl is-active --quiet "$IDEMPIERE_SERVICE"; then
   say "✅ Migration complete. $IDEMPIERE_SERVICE is active."
 else
-  say "⚠️ Service not active. Showing last journal lines:"
+  say "⚠️ Service not active. Showing last journal lines (appended to log):"
   journalctl -u "$IDEMPIERE_SERVICE" -n 200 --no-pager | tee -a "$LOGFILE"
-  say "Please inspect $LOGFILE and journal output above; continuing to finish."
+  say "Please inspect $LOGFILE and journal output above."
 fi
 
 say "Done. Full log saved to: $LOGFILE"
